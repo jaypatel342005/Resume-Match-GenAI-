@@ -1,11 +1,9 @@
-
 import os
 import tempfile
 from dotenv import load_dotenv
 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
-from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnablePassthrough
+from langchain_core.output_parsers import JsonOutputParser
 from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Chroma
@@ -14,10 +12,6 @@ load_dotenv()
 
 llm = ChatMistralAI(model="mistral-small-latest", temperature=0)
 embeddings_model = MistralAIEmbeddings(model="mistral-embed")
-
-
-
-
 
 skill_prompt = ChatPromptTemplate.from_template("""
 Extract skills from the document below and categorize them into JSON.
@@ -87,8 +81,6 @@ Output valid JSON only. Do not include markdown codeblocks or extra text.
 }}
 """)
 
-
-
 def parse_document(text):
     if isinstance(text, str) and text.endswith(".pdf") and os.path.exists(text):
         loader = PyPDFLoader(text)
@@ -96,18 +88,14 @@ def parse_document(text):
         return "\n".join(page.page_content for page in pages).strip()
     return text.strip()
 
-
 def parse_pdf_bytes(pdf_bytes):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
-
     loader = PyPDFLoader(tmp_path)
     pages = loader.load()
-    os.unlink(tmp_path)  
+    os.unlink(tmp_path)
     return "\n".join(page.page_content for page in pages).strip()
-
-
 
 def format_skill_list(skills_list):
     items = []
@@ -118,7 +106,6 @@ def format_skill_list(skills_list):
             items.append(str(item))
     return ", ".join(items)
 
-
 def flatten_skills(skills_dict):
     parts = []
     for key in ["technical_skills", "frameworks", "databases", "cloud", "core_concepts"]:
@@ -127,57 +114,53 @@ def flatten_skills(skills_dict):
             parts.append(format_skill_list(val))
     return ", ".join(parts)
 
-
-def run_similarity_and_rag(data):
-   
+def get_similarity_context(resume_skills, jd_skills):
     resume_chunks = []
-    for key, val in data["resume"].items():
+    for key, val in resume_skills.items():
         if val:
             resume_chunks.append(f"{key.replace('_', ' ').title()}: {format_skill_list(val)}")
-
-    jd_full = flatten_skills(data["jd"])
-
+    if not resume_chunks:
+        return ""
+    jd_full = flatten_skills(jd_skills)
     db = Chroma.from_texts(resume_chunks, embedding=embeddings_model)
-    retriever = db.as_retriever(search_kwargs={"k": 3})
+    retriever = db.as_retriever(search_kwargs={"k": min(3, len(resume_chunks))})
     docs = retriever.invoke(jd_full)
-    data["retrieved_resume"] = "\n".join(d.page_content for d in docs)
-    return data
+    return "\n".join(d.page_content for d in docs)
 
-
-def run_explanation(data):
-    sub_chain = explanation_prompt | llm | StrOutputParser() | JsonOutputParser()
-
-    result = sub_chain.invoke({
-        "resume" : data["retrieved_resume"],
-        "jd"     : data["raw_jd"]
-    })
-
+def run_matching_pipeline(resume_raw, jd_raw):
+    resume_text = parse_document(resume_raw)
+    jd_text = parse_document(jd_raw)
+    parser = JsonOutputParser()
+    
+    resume_msgs = skill_prompt.format_messages(document=resume_text)
+    resume_resp = llm.invoke(resume_msgs)
+    resume_skills = parser.invoke(resume_resp)
+    
+    jd_msgs = skill_prompt.format_messages(document=jd_text)
+    jd_resp = llm.invoke(jd_msgs)
+    jd_skills = parser.invoke(jd_resp)
+    
+    similarity_context = get_similarity_context(resume_skills, jd_skills)
+    
+    explanation_msgs = explanation_prompt.format_messages(
+        resume=similarity_context,
+        jd=jd_text
+    )
+    explanation_resp = llm.invoke(explanation_msgs)
+    result = parser.invoke(explanation_resp)
+    
     score = result.get("score", 0)
-
     return {
-        "score"                  : score,
-        "similarity"             : round(score / 100, 4),
-        "matched_skills"         : result.get("matched_skills", []),
-        "missing_skills"         : result.get("missing_skills", []),
-        "suggestions"            : result.get("suggestions", []),
-        "overall_recommendation" : result.get("overall_recommendation", "")
+        "score": score,
+        "similarity": round(score / 100, 4),
+        "matched_skills": result.get("matched_skills", []),
+        "missing_skills": result.get("missing_skills", []),
+        "suggestions": result.get("suggestions", []),
+        "overall_recommendation": result.get("overall_recommendation", "")
     }
 
+class PipelineWrapper:
+    def invoke(self, data):
+        return run_matching_pipeline(data["resume"], data["jd"])
 
-parse_runnable = RunnableLambda(parse_document)
-skill_chain = skill_prompt | llm | StrOutputParser() | JsonOutputParser()
-
-resume_chain = RunnableLambda(lambda x: x["resume"]) | parse_runnable | skill_chain
-jd_chain     = RunnableLambda(lambda x: x["jd"])     | parse_runnable | skill_chain
-
-parallel_chain = RunnableParallel(
-    resume = resume_chain,
-    jd     = jd_chain,
-    raw_jd = RunnableLambda(lambda x: parse_document(x["jd"]))
-)
-
-pipeline = (
-    parallel_chain
-    | RunnableLambda(run_similarity_and_rag)
-    | RunnableLambda(run_explanation)
-)
+pipeline = PipelineWrapper()

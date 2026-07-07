@@ -123,7 +123,7 @@ def get_similarity_context(resume_skills, jd_skills):
         return ""
     jd_full = flatten_skills(jd_skills)
     db = Chroma.from_texts(resume_chunks, embedding=embeddings_model)
-    retriever = db.as_retriever(search_kwargs={"k": min(3, len(resume_chunks))})
+    retriever = db.as_retriever(search_kwargs={"k": min(4, len(resume_chunks))})
     docs = retriever.invoke(jd_full)
     return "\n".join(d.page_content for d in docs)
 
